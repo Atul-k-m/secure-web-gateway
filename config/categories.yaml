@@ -41,14 +41,17 @@ news:
   - thehindu.com
   - ndtv.com
 
-finance:
+finance:            # banking and brokerage: Do-Not-Inspect in the shipped policy
   - paypal.com
-  - razorpay.com
   - zerodha.com
   - hdfcbank.com
   - icicibank.com
   - onlinesbi.sbi
   - chase.com
+
+payments:           # payment processors' APIs: inspected, so DLP can see card data
+  - razorpay.com
+  - stripe.com
 
 health:
   - who.int

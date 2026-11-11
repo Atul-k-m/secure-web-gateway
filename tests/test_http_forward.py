@@ -6,7 +6,7 @@ from tests.support import recv_all
 
 LOG_FIELDS = [
     "time", "txn_id", "client_ip", "user", "method", "host", "url", "status", "category", "rule",
-    "action", "inspected",
+    "action", "inspected", "file_type", "dlp",
     "bytes_in", "bytes_out", "upstream_latency_ms", "duration_ms", "tls_version", "sni", "error",
 ]
 

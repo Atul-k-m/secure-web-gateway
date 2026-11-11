@@ -1,0 +1,54 @@
+# The policy test suite: what the SHIPPED policy (config/policy.yaml,
+# categories.yaml, directory.yaml) must decide. Each case names a user (or
+# "anonymous"), a URL, optionally an upload or a download, and the expected
+# result: allow | caution | block | no-inspect.
+#
+# tests/test_policy_cases.py runs every case; phase 8's bench reports the
+# pass rate. All card numbers are the networks' published test numbers, the
+# Aadhaar-format number is synthetic (valid checksum, built by the test
+# runner), and the AWS key is AWS's documented example.
+
+- {name: Gambling is blocked for everyone, user: asha, url: "https://www.bet365.com/", expect: block}
+- {name: Gambling is blocked for anonymous users too, user: anonymous, url: "http://www.pokerstars.com/", expect: block}
+- {name: Malware test page is blocked, user: meera, url: "https://testsafebrowsing.appspot.com/s/malware.html", expect: block}
+- {name: The example block rule works on subdomains, user: dev, url: "https://www.example.net/", expect: block}
+- {name: Label-based matching does not over-match, user: dev, url: "https://notexample.net/", expect: allow}
+- {name: Uncategorized sites are allowed, user: dev, url: "https://example.org/", expect: allow}
+
+- {name: Engineers may use generative AI, user: asha, url: "https://chatgpt.com/", expect: allow}
+- {name: Finance gets a caution page for generative AI, user: meera, url: "https://claude.ai/new", expect: caution}
+- {name: Contractors get a caution page for generative AI, user: dev, url: "https://www.perplexity.ai/", expect: caution}
+- {name: Anonymous users get a caution page for generative AI, user: anonymous, url: "https://chatgpt.com/", expect: caution}
+- {name: Social media gets a caution page, user: asha, url: "https://www.reddit.com/r/python", expect: caution}
+- {name: Gemini is generative AI, not search, user: meera, url: "https://gemini.google.com/app", expect: caution}
+- {name: Google search is allowed, user: meera, url: "https://www.google.com/search?q=swg", expect: allow}
+
+- {name: Contractors may not use file sharing, user: dev, url: "https://www.dropbox.com/home", expect: block}
+- {name: Engineers may use file sharing, user: ravi, url: "https://www.dropbox.com/home", expect: allow}
+
+- {name: Banking is not inspected, user: asha, url: "https://www.hdfcbank.com/", expect: no-inspect}
+- {name: Health sites are not inspected, user: asha, url: "https://www.mayoclinic.org/", expect: no-inspect}
+- {name: Signal is not inspected (pinning), user: kiran, url: "https://chat.signal.org/", expect: no-inspect}
+- {name: GitHub is inspected, user: asha, url: "https://github.com/", expect: allow}
+
+- {name: Program downloads are blocked, user: meera, url: "https://downloads.example.org/setup.exe", download: exe, expect: block}
+- {name: A program disguised as text is blocked, user: meera, url: "https://downloads.example.org/notes.txt", download: exe, content_type: text/plain, expect: block}
+- {name: Linux programs are blocked too, user: dev, url: "https://downloads.example.org/tool", download: elf, expect: block}
+- {name: Engineers may download programs from GitHub, user: ravi, url: "https://github.com/x/y/releases/download/v1/tool.exe", download: exe, expect: allow}
+- {name: Engineers may download from githubusercontent, user: asha, url: "https://objects.githubusercontent.com/a/b", download: exe, expect: allow}
+- {name: Contractors may not download programs from GitHub, user: dev, url: "https://github.com/x/y/releases/download/v1/tool.exe", download: exe, expect: block}
+- {name: PDFs download normally, user: dev, url: "https://example.org/report.pdf", download: pdf, expect: allow}
+
+- {name: Contractors may not upload archives, user: dev, url: "https://upload.example.org/", upload_file: zip, expect: block}
+- {name: Engineers may upload archives, user: asha, url: "https://upload.example.org/", upload_file: zip, expect: allow}
+
+- {name: Card numbers in uploads are blocked, user: asha, url: "https://forms.example.org/submit", upload_text: "card=4111 1111 1111 1111", expect: block}
+- {name: Card numbers in dashes are found, user: dev, url: "https://forms.example.org/submit", upload_text: "5555-5555-5555-4444", expect: block}
+- {name: A Luhn-invalid number is not a card, user: dev, url: "https://forms.example.org/submit", upload_text: "4111 1111 1111 1112", expect: allow}
+- {name: Finance may send cards to the payment processor, user: meera, url: "https://api.razorpay.com/v1/payments", upload_text: "4111111111111111", expect: allow}
+- {name: Others may not send cards to the payment processor, user: asha, url: "https://api.razorpay.com/v1/payments", upload_text: "4111111111111111", expect: block}
+- {name: Aadhaar numbers are blocked, user: kiran, url: "https://forms.example.org/kyc", upload_text: "id {aadhaar}", expect: block}
+- {name: AWS keys are blocked, user: ravi, url: "https://paste.example.org/", upload_text: '{"key": "AKIAIOSFODNN7EXAMPLE"}', expect: block}
+- {name: Private keys are blocked, user: ravi, url: "https://paste.example.org/", upload_text: "-----BEGIN RSA PRIVATE KEY-----", expect: block}
+- {name: Ordinary text uploads are allowed, user: ravi, url: "https://paste.example.org/", upload_text: "meeting notes, nothing secret", expect: allow}
+- {name: A phone number is not an Aadhaar number, user: ravi, url: "https://forms.example.org/", upload_text: "call 98765 43210", expect: allow}

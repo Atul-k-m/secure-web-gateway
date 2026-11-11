@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import gzip
 import http.client
 import ipaddress
 import json
@@ -14,6 +15,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -23,6 +25,18 @@ from cryptography.x509.oid import NameOID
 from swg.accesslog import AccessLog
 from swg.proxy import Gateway
 from swg.settings import Settings
+
+# Tiny stand-ins with the right first bytes. None of them do anything.
+SAMPLE_FILES = {
+    "exe": b"MZ\x90\x00\x03\x00\x00\x00" + b"\x00" * 120 + b"This program cannot be run in DOS mode.",
+    "elf": b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 120,
+    "zip": b"PK\x03\x04\x14\x00\x00\x00\x08\x00" + b"\x00" * 60,
+    "pdf": b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n",
+    "text": b"just some text\n",
+}
+
+# Request paths of uploads the origin actually received.
+RECEIVED_UPLOADS: set[str] = set()
 
 # --------------------------------------------------------------------------
 # Certificates
@@ -157,6 +171,19 @@ class OriginHandler(BaseHTTPRequestHandler):
             self.close_connection = True
         elif self.path.startswith("/bytes/"):
             self._send(200, b"x" * int(self.path.rsplit("/", 1)[1]))
+        elif self.path.startswith("/file"):
+            # /file?kind=exe&ct=text/plain&gzip=1 : a sample file, labelled
+            # however the test wants, optionally gzip-encoded.
+            query = parse_qs(urlsplit(self.path).query)
+            body = SAMPLE_FILES[query.get("kind", ["exe"])[0]]
+            self.send_response(200)
+            self.send_header("Content-Type", query.get("ct", ["application/octet-stream"])[0])
+            if "gzip" in query:
+                body = gzip.compress(body)
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self._send(404, b"not found")
 
@@ -166,8 +193,10 @@ class OriginHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        if self.path == "/echo":
-            self._send(200, self._read_body())
+        if self.path.startswith("/echo"):
+            body = self._read_body()
+            RECEIVED_UPLOADS.add(self.path)  # proves an upload reached the origin
+            self._send(200, body)
         else:
             self._read_body()
             self._send(404, b"not found")
@@ -201,10 +230,10 @@ class OriginServer:
 
 
 class GatewayThread:
-    def __init__(self, settings: Settings, policy=None, ca=None):
+    def __init__(self, settings: Settings, policy=None, ca=None, directory=None):
         self.settings = settings
         self.log = AccessLog(settings.access_log, echo=False)
-        self.gateway = Gateway(settings, self.log, policy=policy, ca=ca)
+        self.gateway = Gateway(settings, self.log, policy=policy, ca=ca, directory=directory)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self._ready = threading.Event()

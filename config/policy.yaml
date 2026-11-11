@@ -1,10 +1,19 @@
-# Gateway policy. Rules are checked top to bottom; the first match wins.
+# Gateway policy.
+#
+# Each rule list is checked top to bottom, and the first rule that matches
+# wins, so put exceptions above the general rule they carve out of.
+#
+# Any rule can be narrowed with these fields. A rule matches when every
+# field it sets matches; a field matches when any of its values does:
+#   users:      [asha]            these users (see config/directory.yaml)
+#   groups:     [contractors]     members of any of these groups
+#   domains:    [github.com]      this host or any subdomain of it
+#   categories: [file-sharing]    see config/categories.yaml
 
 ssl_inspection:
   # Traffic here is tunnelled untouched: never decrypted, never re-signed.
-  # Use it for apps that pin their certificates (they refuse the gateway's
-  # certificate and break) and for categories you choose not to read for
-  # privacy reasons, such as banking and health.
+  # For apps that pin their certificates, and for categories you choose
+  # not to read. File-type and DLP rules can't see inside these tunnels.
   do_not_inspect:
     domains:
       - signal.org          # Signal pins its certificates
@@ -15,7 +24,8 @@ ssl_inspection:
       - health
 
 url_filtering:
-  default_action: allow
+  default_action: allow       # allow | caution | block
+  caution_minutes: 30         # how long "Continue" on a caution page lasts
   rules:
     - name: Block gambling
       categories: [gambling]
@@ -25,6 +35,72 @@ url_filtering:
       categories: [security-test]
       action: block
 
+    - name: Contractors may not use file sharing
+      groups: [contractors]
+      categories: [file-sharing]
+      action: block
+
+    - name: Engineering may use generative AI
+      groups: [engineering]
+      categories: [generative-ai]
+      action: allow
+
+    - name: Warn before generative AI
+      categories: [generative-ai]
+      action: caution
+
+    - name: Warn before social media
+      categories: [social-media]
+      action: caution
+
     - name: Block example domain
       domains: [example.net]
+      action: block
+
+file_types:
+  # Types are recognised from the Content-Type header AND from the file's
+  # first bytes; a rule matches if either says so. direction: download
+  # (default), upload, or both. Known types: windows-executable,
+  # linux-executable, macos-executable, ole2 (msi, old .doc/.xls), zip, rar,
+  # 7z, gzip, pdf, png, jpeg, gif, script.
+  rules:
+    - name: Engineering may download programs from GitHub
+      groups: [engineering]
+      domains: [github.com, githubusercontent.com]
+      types: [windows-executable, linux-executable, macos-executable]
+      action: allow
+
+    - name: Block program downloads
+      types: [windows-executable, linux-executable, macos-executable]
+      action: block
+
+    - name: Contractors may not upload archives
+      groups: [contractors]
+      types: [zip, rar, 7z]
+      direction: upload
+      action: block
+
+dlp:
+  # Upload bodies are read and scanned before anything is forwarded. Bodies
+  # larger than max_scan_bytes have their first max_scan_bytes scanned and
+  # the rest passed on unscanned (the log records "truncated": true).
+  # Detectors: credit_card, aadhaar, api_key, private_key.
+  max_scan_bytes: 1048576
+  rules:
+    - name: Finance may send card numbers to the payment processor
+      groups: [finance]
+      domains: [razorpay.com]
+      detectors: [credit_card]
+      action: allow
+
+    - name: Block card numbers in uploads
+      detectors: [credit_card]
+      action: block
+
+    - name: Block Aadhaar numbers in uploads
+      detectors: [aadhaar]
+      action: block
+
+    - name: Block API keys and private keys in uploads
+      detectors: [api_key, private_key]
       action: block

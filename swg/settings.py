@@ -32,6 +32,7 @@ class Settings:
 
     policy_file: Path | None = None
     categories_file: Path | None = None
+    directory_file: Path | None = None  # users, groups, IP bindings (until phase 4)
 
     # How clients reach the gateway, e.g. http://10.0.0.5:3128. Goes into
     # the certificates' CRL links (and, in phase 6, the PAC file). Derived
@@ -65,7 +66,10 @@ def load_settings(path: Path | None) -> Settings:
     if path is None:
         return settings
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    top = {"listen", "gateway_url", "access_log", "timeouts", "tls_inspection", "policy_file", "categories_file"}
+    top = {
+        "listen", "gateway_url", "access_log", "timeouts", "tls_inspection",
+        "policy_file", "categories_file", "directory_file",
+    }
     unknown = set(data) - top
     if unknown:
         raise ConfigError(f"{path}: unknown key(s) {sorted(unknown)}")
@@ -90,4 +94,5 @@ def load_settings(path: Path | None) -> Settings:
     settings.gateway_url = data.get("gateway_url") or None
     settings.policy_file = _path(data.get("policy_file"))
     settings.categories_file = _path(data.get("categories_file"))
+    settings.directory_file = _path(data.get("directory_file"))
     return settings

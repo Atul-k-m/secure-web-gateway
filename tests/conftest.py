@@ -56,10 +56,10 @@ def trusts_gateway(inspection_ca):
 
 @pytest.fixture
 def start_gateway(tmp_path, pki, inspection_ca):
-    """Factory: start_gateway(policy=..., inspect=True, trust_origin_ca=True)."""
+    """Factory: start_gateway(policy=..., directory=..., inspect=True, trust_origin_ca=True)."""
     started = []
 
-    def start(policy=None, inspect=True, trust_origin_ca=True):
+    def start(policy=None, inspect=True, trust_origin_ca=True, directory=None):
         settings = Settings(
             listen_port=0,
             access_log=tmp_path / f"access-{len(started)}.log",
@@ -68,7 +68,7 @@ def start_gateway(tmp_path, pki, inspection_ca):
             ca_dir=inspection_ca.directory,
             upstream_ca_file=pki[0] if trust_origin_ca else None,
         )
-        gw = GatewayThread(settings, policy=policy or Policy(), ca=inspection_ca)
+        gw = GatewayThread(settings, policy=policy or Policy(), ca=inspection_ca, directory=directory)
         gw.__enter__()
         started.append(gw)
         return gw

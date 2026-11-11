@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from swg.policy import Categories, Policy, PolicyError, UrlRule, domain_matches
+from swg import filetypes
+from swg.directory import ANONYMOUS, Directory, DirectoryError, Identity
+from swg.policy import Categories, DlpRule, FileTypeRule, Policy, PolicyError, UrlRule, domain_matches
 from swg.settings import ConfigError, load_settings
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -87,3 +89,105 @@ def test_typo_in_gateway_yaml_is_caught(tmp_path):
     bad.write_text("tls_inspection:\n  enable: true\n")
     with pytest.raises(ConfigError, match="enable"):
         load_settings(bad)
+
+
+# ---- phase 3: users, groups, file types, DLP ------------------------------------
+
+ENG = Identity("asha", frozenset({"engineering"}))
+FIN = Identity("meera", frozenset({"finance"}))
+CON = Identity("dev", frozenset({"contractors"}))
+
+
+def test_fields_combine_with_and_values_with_or():
+    rule = UrlRule("r", "block", categories=["ai"], groups=["contractors", "interns"])
+    cats = Categories({"ai": ["ai.test"]})
+    policy = Policy(cats, rules=[rule])
+    assert policy.decide("chat.ai.test", CON).action == "block"  # group AND category
+    assert policy.decide("chat.ai.test", ENG).action == "allow"  # category only
+    assert policy.decide("news.test", CON).action == "allow"  # group only
+    assert policy.decide("chat.ai.test", Identity("x", frozenset({"interns"}))).action == "block"
+
+
+def test_user_rule_and_anonymous():
+    policy = Policy(rules=[UrlRule("only asha", "block", domains=["x.test"], users=["asha"])])
+    assert policy.decide("x.test", ENG).action == "block"
+    assert policy.decide("x.test", ANONYMOUS).action == "allow"
+
+
+def test_file_type_rules_check_direction_and_both_labels():
+    policy = Policy(
+        file_rules=[
+            FileTypeRule("exe down", "block", types=["windows-executable"]),
+            FileTypeRule("zip up", "block", types=["zip"], direction="upload"),
+        ]
+    )
+    exe = filetypes.detect("text/plain", b"MZ\x90\x00")
+    labelled_exe = filetypes.detect("application/x-msdownload", b"")
+    zip_file = filetypes.detect(None, b"PK\x03\x04")
+    assert policy.check_file_type("h.test", ENG, exe, "download").action == "block"
+    assert policy.check_file_type("h.test", ENG, labelled_exe, "download").action == "block"
+    assert policy.check_file_type("h.test", ENG, exe, "upload").action == "allow"
+    assert policy.check_file_type("h.test", ENG, zip_file, "upload").action == "block"
+    assert policy.check_file_type("h.test", ENG, zip_file, "download").action == "allow"
+    assert policy.has_file_rules("download") and policy.has_file_rules("upload")
+
+
+def test_dlp_exception_above_the_general_rule():
+    policy = Policy(
+        dlp_rules=[
+            DlpRule("finance to pay", "allow", groups=["finance"], domains=["pay.test"], detectors=["credit_card"]),
+            DlpRule("cards", "block", detectors=["credit_card"]),
+        ]
+    )
+    assert policy.check_dlp("api.pay.test", FIN, {"credit_card"}).action == "allow"
+    assert policy.check_dlp("other.test", FIN, {"credit_card"}).action == "block"
+    assert policy.check_dlp("api.pay.test", ENG, {"credit_card"}).action == "block"
+    assert policy.check_dlp("api.pay.test", ENG, {"aadhaar"}).rule is None  # no rule for it
+    assert policy.scans_uploads("anything.test", ENG)
+
+
+@pytest.mark.parametrize(
+    "yaml_text, message",
+    [
+        ("file_types:\n  rules:\n    - {name: x, action: block, types: [exe]}\n", "unknown file type"),
+        ("file_types:\n  rules:\n    - {name: x, action: block, types: [zip], direction: sideways}\n", "direction"),
+        ("dlp:\n  rules:\n    - {name: x, action: block, detectors: [ssn]}\n", "unknown detector"),
+        ("dlp:\n  rules:\n    - {name: x, action: caution, detectors: [api_key]}\n", "action"),
+        ("url_filtering:\n  rules:\n    - {name: x, action: warn}\n", "action"),
+        ("url_filtering:\n  rules:\n    - {name: x, action: block, group: [a]}\n", "group"),
+    ],
+)
+def test_policy_mistakes_are_reported(tmp_path, yaml_text, message):
+    path = tmp_path / "policy.yaml"
+    path.write_text(yaml_text)
+    with pytest.raises(PolicyError, match=message):
+        Policy.load(path, None)
+
+
+def test_directory_binds_ips_to_users():
+    directory = Directory.load(ROOT / "config/directory.yaml")
+    assert len(directory.users) == 5
+    assert set().union(*directory.users.values()) == {"engineering", "finance", "contractors"}
+    assert directory.identify("127.0.0.1").user == "asha"
+    assert directory.identify("10.1.2.3") == ANONYMOUS
+    with pytest.raises(DirectoryError, match="unknown user"):
+        Directory({"a": []}, {"10.0.0.1": "nobody"})
+
+
+def test_lint_flags_content_rules_on_uninspected_traffic():
+    # The first shipped policy had exactly this: a DLP rule for razorpay.com
+    # while razorpay.com was in the Do-Not-Inspect "finance" category.
+    policy = Policy(
+        Categories({"finance": ["razorpay.com"]}),
+        dni_categories=["finance"],
+        dlp_rules=[DlpRule("cards to razorpay", "allow", domains=["razorpay.com"], detectors=["credit_card"])],
+        file_rules=[FileTypeRule("bank files", "block", categories=["finance"], types=["zip"])],
+    )
+    warnings = " | ".join(policy.lint())
+    assert len(policy.lint()) == 2
+    assert "razorpay.com is never inspected" in warnings
+    assert "category finance is never inspected" in warnings
+
+
+def test_shipped_policy_has_no_lint_warnings():
+    assert Policy.load(ROOT / "config/policy.yaml", ROOT / "config/categories.yaml").lint() == []

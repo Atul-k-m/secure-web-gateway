@@ -33,8 +33,10 @@ class LogEntry:
     status: int | None = None
     category: str | None = None  # URL category from config/categories.yaml
     rule: str | None = None  # policy rule that decided; None = default action
-    action: str = "allow"  # allow / block
+    action: str = "allow"  # allow / block / caution / caution-accepted
     inspected: bool = False  # True when the gateway decrypted this HTTPS request
+    file_type: str | None = None  # detected type of the upload or download
+    dlp: dict | None = None  # upload scan: bytes scanned, truncated, match counts
     bytes_in: int = 0  # bytes the gateway read from the client
     bytes_out: int = 0  # bytes the gateway wrote to the client
     upstream_latency_ms: float | None = None

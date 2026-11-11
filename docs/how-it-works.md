@@ -17,11 +17,12 @@ Sections are written as each phase lands:
 | [6. SNI](#6-sni-server-name-indication) | 1 | written |
 | [7. The access log](#7-the-access-log) | 1 | written |
 | [8. Certificate chains and TLS inspection](#8-certificate-chains-and-tls-inspection) | 2 | written |
-| [9. Proxy authentication: HTTP 407](#9-proxy-authentication-http-407) | 4 | to do |
-| [10. LDAP bind](#10-ldap-bind) | 4 | to do |
-| [11. SAML 2.0 single sign-on](#11-saml-20-single-sign-on) | 4 | to do |
-| [12. DNS security](#12-dns-security) | 5 | to do |
-| [13. PAC files](#13-pac-files) | 6 | to do |
+| [9. The policy engine: users, caution, file types, DLP](#9-the-policy-engine-users-caution-file-types-dlp) | 3 | written |
+| [10. Proxy authentication: HTTP 407](#10-proxy-authentication-http-407) | 4 | to do |
+| [11. LDAP bind](#11-ldap-bind) | 4 | to do |
+| [12. SAML 2.0 single sign-on](#12-saml-20-single-sign-on) | 4 | to do |
+| [13. DNS security](#13-dns-security) | 5 | to do |
+| [14. PAC files](#14-pac-files) | 6 | to do |
 
 ## Capturing traffic for the screenshots
 
@@ -63,7 +64,7 @@ talks to the origin directly. Everything below follows from that.
 How traffic reaches a SWG:
 
 * **Explicit proxy** (this project): the client is configured with the proxy
-  address, by hand or with a PAC file (section 13). The client knows it is
+  address, by hand or with a PAC file (section 14). The client knows it is
   talking to a proxy and speaks proxy HTTP to it.
 * **Transparent / tunnel forwarding**: the network sends traffic to the proxy
   without the client knowing, for example through a GRE or IPsec tunnel from
@@ -506,15 +507,17 @@ Do-Not-Inspect tunnel:
 | `time` | UTC time the request head was fully received |
 | `txn_id` | random ID for this transaction, also printed on block and error pages. A user quotes it in a ticket; support runs `Select-String <txn_id> logs\access.log`. |
 | `client_ip` | the client's address, as seen by the gateway |
-| `user` | authenticated user, from phase 4. `null` until then. |
+| `user` | who made the request: from `config/directory.yaml`'s IP bindings for now, from proxy authentication in phase 4. `null` if unknown. |
 | `method` | `GET`, `POST`, `CONNECT`, ... |
 | `host` | destination host name (lower-cased) |
 | `url` | full URL for HTTP and inspected HTTPS, `host:port` for an untouched tunnel |
 | `status` | status the gateway sent to the client (the origin's, or the gateway's own 4xx/5xx) |
 | `category` | URL category from `config/categories.yaml`, or `null` if uncategorized |
 | `rule` | name of the policy rule that decided, `null` when the default action applied |
-| `action` | `allow` or `block` (phase 3 adds `caution`) |
+| `action` | `allow`, `block`, `caution` (warning page shown) or `caution-accepted` (the user clicked Continue) |
 | `inspected` | `true` when the gateway decrypted this HTTPS request (section 8) |
+| `file_type` | type of the download or upload, from magic bytes or Content-Type (section 9.4), when a file-type rule made the gateway look |
+| `dlp` | for scanned uploads: `{"scanned_bytes": 34, "truncated": false, "matches": {"credit_card": 1}}`. Counts only, never the data. |
 | `bytes_in` | bytes the gateway **read from the client** for this request: request line, headers and body. For an inspected request these are the decrypted HTTP bytes. For an untouched tunnel, every TLS byte the client sent. |
 | `bytes_out` | bytes the gateway **wrote to the client**: status line, headers and body (decrypted, for inspected requests) |
 | `upstream_latency_ms` | HTTP and inspected HTTPS: from starting the origin connection (or reusing one) to receiving the response head, i.e. connect (+ TLS handshake) plus time to first byte. Untouched tunnel: DNS + TCP connect only. |
@@ -898,22 +901,261 @@ doesn't reach them:
 > ends the handshake (an alert, or a FIN/RST right after the server's
 > Certificate). Then show the gateway's log line for the same attempt.
 
-## 9. Proxy authentication: HTTP 407
+## 9. The policy engine: users, caution, file types, DLP
+
+### 9.1 Where policy runs in a request
+
+Every check happens at a point where the gateway can still say no. The
+order (`Gateway._forward`, stages 1-6) matters:
+
+```
+request head ──► 1. URL policy (who + where) ──► block page / caution page / go on
+                         │
+request body ──► 2. upload check: file type + DLP ──► block page (body never forwarded)
+                         │
+                 3-4. forward to origin, read the response head
+                         │
+response body ─► 5. download check: first 512 bytes ──► block page (rest never sent)
+                         │
+                 6. relay the response to the client
+```
+
+Two things follow from that order:
+
+* An upload is checked **before** it is forwarded. The body is buffered
+  (up to `max_scan_bytes`), scanned, and only then sent on. A blocked upload
+  never reaches the site. A test proves this: the test origin records every
+  upload it receives, and blocked ones aren't there. In the live run the
+  gateway blocked a card number bound for `postman-echo.com` in 0.9 ms with
+  `upstream_latency_ms: null`: it never opened a connection.
+* A download is checked on its **first bytes**, before the client gets the
+  response head. The gateway reads 512 bytes, decides, and only then starts
+  relaying. The 26.5 MB Python installer (`python-3.12.7-amd64.exe`,
+  26,538,304 bytes) was blocked in 0.34 s, and the client received 1,911
+  bytes, all of them the block page.
+
+None of this can work on a tunnel the gateway doesn't decrypt. File-type and
+DLP rules see inspected HTTPS and plain HTTP only. The lint check in 9.6
+catches rules that silently can't fire for this reason.
+
+### 9.2 Rules, users and groups
+
+`config/policy.yaml` has three rule lists (`url_filtering`, `file_types`,
+`dlp`). Each is checked top to bottom, and **the first matching rule
+wins**, as in a firewall. So exceptions go above the rule they carve out of:
+
+```yaml
+- name: Engineering may use generative AI      # exception first
+  groups: [engineering]
+  categories: [generative-ai]
+  action: allow
+- name: Warn before generative AI              # general rule second
+  categories: [generative-ai]
+  action: caution
+```
+
+Any rule can be narrowed with `users`, `groups`, `domains` and `categories`.
+A rule matches when **every field it sets** matches (AND), and a field
+matches when **any of its values** does (OR). So
+`groups: [contractors], categories: [file-sharing]` means "a contractor AND a
+file-sharing site", while `categories: [gambling, security-test]` means
+"either category". A rule that sets no fields matches everything.
+
+Who the user is comes from `config/directory.yaml` until phase 4. It's a
+stand-in for Active Directory with the same 5 users in 3 groups (engineering:
+asha, ravi; finance: meera, kiran; contractors: dev), plus `ip_bindings` that
+say which user is behind which client IP. Zscaler calls the same idea an "IP
+surrogate": once a user has authenticated, requests from their IP are tied to
+them for a while. A client whose IP isn't bound is anonymous, so rules with
+`users` or `groups` never match it.
+
+With the shipped policy (`python -m swg check-policy` prints every case):
+
+| | chatgpt.com | dropbox.com | reddit.com | bet365.com |
+|---|---|---|---|---|
+| asha (engineering) | allow | allow | caution | block |
+| meera (finance) | caution | allow | caution | block |
+| dev (contractors) | caution | **block** | caution | block |
+| anonymous | caution | allow | caution | block |
+
+### 9.3 The caution action
+
+Caution means "warn, then let them through". It's meant for categories that
+aren't forbidden but deserve a second thought (social media, generative AI).
+
+1. The first request gets a warning page (`403`). Its **Continue** link is the
+   same URL plus `?swg-caution=<expiry>.<signature>`.
+2. The signature is an HMAC-SHA256 over *(user, host, expiry)*, keyed with a
+   random secret that only this gateway process knows (`swg/caution.py`). A
+   user can't forge a link for another site, another user, or a later
+   expiry, and a link expires after 10 minutes.
+3. When the gateway sees a valid token, it remembers *(user, host)* as
+   accepted for `caution_minutes` (30), and answers `302` to the URL without
+   the parameter. The origin never sees the token.
+4. Requests during those 30 minutes are allowed and logged as
+   `caution-accepted`, so the log shows who clicked through.
+
+Live, against `https://www.reddit.com/`:
+
+```
+GET https://www.reddit.com/   403  asha  caution            rule=Warn before social media
+GET https://www.reddit.com/   302  asha  caution-accepted   (the Continue link)
+GET https://www.reddit.com/   200  asha  caution-accepted
+```
+
+Why 403 and not 200 for the warning page: a script or API client that hits
+a caution page should see a failure, not an HTML page it might parse as the
+real answer. Browsers show the page either way.
+
+A caution rule on a Do-Not-Inspect site can't show a page, because there's
+no decrypted HTTP to answer. The tunnel is allowed.
+
+> **[Wireshark screenshot 16: the caution redirect]**
+> With `SSLKEYLOGFILE` set (8.2), open `https://www.reddit.com/` in a
+> browser that trusts the root, and click Continue. Filter
+> `http.request.uri contains "swg-caution" || http.response.code == 302`.
+> Show the request carrying the token and the gateway's 302. Then show, on
+> the Wi-Fi side, that the request reaching reddit has no `swg-caution`
+> parameter.
+
+### 9.4 File types: Content-Type and magic bytes
+
+A file's type can be read two ways (`swg/filetypes.py`):
+
+* **Content-Type**, the header: what the sender *says* it is.
+* **Magic bytes**, the first few bytes: what it *is*. Formats start with a
+  fixed signature.
+
+| Signature (hex) | ASCII | Type |
+|---|---|---|
+| `4D 5A` | `MZ` | Windows program (.exe, .dll), named after Mark Zbikowski |
+| `7F 45 4C 46` | `.ELF` | Linux program |
+| `CF FA ED FE` | | macOS program (Mach-O, 64-bit) |
+| `D0 CF 11 E0 A1 B1 1A E1` | | OLE2 compound file: .msi, legacy .doc/.xls |
+| `50 4B 03 04` | `PK..` | ZIP, and everything that is secretly a ZIP: .docx, .xlsx, .jar, .apk |
+| `52 61 72 21 1A 07` | `Rar!..` | RAR |
+| `25 50 44 46 2D` | `%PDF-` | PDF |
+| `23 21` | `#!` | script with an interpreter line |
+
+The gateway blocks if **either** answer matches a blocked type, and the
+bytes win when they disagree. Malware is routinely served as `text/plain` or
+`application/octet-stream`, so a filter that trusts the header is easy to get
+past. The block page says so: "downloading a windows-executable file (sent
+as text/plain) is not allowed".
+
+**Content-Encoding vs Content-Type.** If the server gzip-compresses the
+response (`Content-Encoding: gzip`), the first bytes on the wire are gzip's
+(`1F 8B`), not the file's. The gateway decompresses the first chunk before
+sniffing; a test serves a gzip-encoded .exe to check this. Brotli (`br`)
+isn't in Python's standard library, so for brotli-encoded responses only the
+Content-Type is checked. That's a known gap, written down rather than hidden.
+
+Uploads are checked the same way, per part: a browser upload is
+`multipart/form-data`, a body made of several parts (form fields and files),
+each with its own headers. The gateway splits it (`dlp.extract_parts`, using
+Python's `email` parser, since multipart is a MIME format) and checks every
+file in it. A ZIP renamed to `report.pdf` is still a ZIP.
+
+> **[Wireshark screenshot 17: an executable disguised as text]**
+> Decrypted capture (8.2). Fetch an .exe from a server that labels it
+> `text/plain` (the test origin does: `/file?kind=exe&ct=text/plain`).
+> Highlight `Content-Type: text/plain` in the origin's response and the
+> `4D 5A` ("MZ") at the start of its body in the hex pane, then the
+> gateway's 403 to the client.
+
+### 9.5 DLP: finding sensitive data in uploads
+
+`swg/dlp.py` scans upload bodies for four kinds of data. The hard part of
+DLP isn't finding numbers, it's *not* flagging every long number. Each
+detector adds a validity check that random digits rarely pass:
+
+| Detector | Pattern | Validity check |
+|---|---|---|
+| `credit_card` | 13-19 digits, optional spaces or dashes | **Luhn** checksum *and* a real card-network prefix (Visa 4…, Mastercard 51-55/2221-2720, Amex 34/37, Discover, JCB, RuPay, Diners) |
+| `aadhaar` | 12 digits, first digit 2-9, optionally `XXXX XXXX XXXX` with consistent separators | **Verhoeff** checksum, the check-digit scheme UIDAI uses for Aadhaar |
+| `api_key` | AWS `AKIA…`, GitHub `ghp_…`, Slack `xoxb-…`, Stripe `sk_live_…`, Google `AIza…`, OpenAI, Anthropic | fixed prefixes and lengths are already specific |
+| `private_key` | `-----BEGIN … PRIVATE KEY-----` | |
+
+**Luhn** (cards): from the right, double every second digit (subtract 9 if
+that gives more than 9), add everything up; the total must end in 0. For
+`4111 1111 1111 1111` the total is 30, so it passes. Change one digit and it
+fails. Luhn catches every single-digit typo, but a random number still
+passes 1 time in 10, which is why the prefix check is also needed. An IMEI
+(phone serial) also uses Luhn; the test suite checks that a Luhn-valid IMEI
+isn't reported as a card.
+
+**Verhoeff** (Aadhaar): a check digit built on the dihedral group D5 instead
+of addition. It catches every single-digit error *and* every swap of two
+adjacent digits, which Luhn misses for 09↔90. The test vector from the
+literature: the check digit of `236` is `3`, so `2363` is valid.
+
+Edge cases the detectors handle, each with a test:
+
+* a card number inside a longer digit run (an order ID) isn't reported:
+  both ends are guarded against more digits;
+* a 10-digit phone number, a Luhn-failing 16-digit number, and an Aadhaar
+  with a wrong check digit aren't reported;
+* form fields are URL-decoded first (`4111+1111+…` is how a browser sends a
+  card typed with spaces), and multipart bodies are split into parts;
+* bodies bigger than `max_scan_bytes` (1 MiB) have their first 1 MiB
+  scanned and the rest forwarded unscanned, and the log records
+  `"truncated": true`. A size limit is a real limitation of every inline DLP.
+  It's logged, so it isn't a silent hole.
+
+**What the log keeps.** Only counts and redacted hints: `"matches":
+{"credit_card": 1}` in the log, "visa ending 1111" on the block page. A DLP
+system that stores what it caught is itself a database of card numbers.
+
+> **[Wireshark screenshot 18: a blocked upload never leaves]**
+> Capture loopback and Wi-Fi together, with the key log from 8.2. Run
+> `curl.exe --cacert ca\swg-root-ca.crt -x http://127.0.0.1:3128 -d "card=4111 1111 1111 1111" https://postman-echo.com/post`.
+> Show the POST arriving on loopback, the gateway's 403, and *no* new
+> connection to postman-echo.com on the Wi-Fi side.
+
+### 9.6 Testing the policy itself
+
+`tests/policy_cases.yaml` lists what the shipped policy must decide: 38
+cases covering users, groups, caution, Do-Not-Inspect, downloads, uploads and
+DLP. Run it any time the policy changes:
+
+```
+python -m swg check-policy
+...
+PASS  Finance may send cards to the payment processor  [allow; Finance may send card numbers to the payment processor]
+38/38 cases passed (100.0%)
+```
+
+On its first run the suite **failed two cases** and found a real bug in the
+policy. `razorpay.com` was in the `finance` category, which is
+Do-Not-Inspect, so the rule "Finance may send card numbers to the payment
+processor" could never fire. Worse, card numbers from *anyone* went to
+Razorpay unscanned. The fix was to move payment processors into their own,
+inspected `payments` category. Because the mistake is easy to make,
+`Policy.lint()` now warns about it at startup and in `check-policy`:
+
+```
+WARNING rule 'cards to razorpay': razorpay.com is never inspected (do_not_inspect category finance), so this rule can't see its HTTPS traffic
+```
+
+Mistakes in the YAML itself (an unknown key, action, category, file type or
+detector) stop the gateway at startup with a message that names the rule.
+
+## 10. Proxy authentication: HTTP 407
 
 *Written in phase 4.*
 
-## 10. LDAP bind
+## 11. LDAP bind
 
 *Written in phase 4.*
 
-## 11. SAML 2.0 single sign-on
+## 12. SAML 2.0 single sign-on
 
 *Written in phase 4.*
 
-## 12. DNS security
+## 13. DNS security
 
 *Written in phase 5.*
 
-## 13. PAC files
+## 14. PAC files
 
 *Written in phase 6.*

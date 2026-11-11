@@ -70,6 +70,51 @@ def block_page(entry: LogEntry) -> str:
     )
 
 
+def caution_page(entry: LogEntry, continue_url: str, minutes: float) -> str:
+    return _page(
+        "Caution - secure-web-gateway",
+        '<div class="tag" style="color:#b54708">Caution</div>'
+        "<h1>Are you sure you want to continue?</h1>"
+        f"<p>Your organisation's web policy asks you to think twice before using sites in "
+        f"the <strong>{html.escape(entry.category or 'uncategorized')}</strong> category. "
+        "Activity on this site may be logged.</p>"
+        f'<p><a href="{html.escape(continue_url, quote=True)}" '
+        'style="display:inline-block;padding:10px 16px;border-radius:8px;background:#1d2330;'
+        'color:#fff;text-decoration:none;font-weight:600">Continue to the site</a></p>'
+        f"<p class=meta>Continuing allows this site for {minutes:g} minutes.</p>"
+        + _details(
+            [
+                ("URL", entry.url),
+                ("Rule", entry.rule),
+                ("User", entry.user),
+                ("Transaction ID", entry.txn_id),
+            ]
+        ),
+    )
+
+
+def content_block_page(entry: LogEntry, reason: str) -> str:
+    """A block for what's *in* the request or response: file type or DLP."""
+    return _page(
+        "Blocked - secure-web-gateway",
+        '<div class="tag">Blocked by policy</div>'
+        "<h1>This transfer was blocked</h1>"
+        f"<p>{html.escape(reason[0].upper() + reason[1:])}. Nothing was sent on to the site. "
+        "If you need this for work, contact support and quote the transaction ID below.</p>"
+        + _details(
+            [
+                ("URL", entry.url),
+                ("Rule", entry.rule or "default action"),
+                ("Detected type", entry.file_type),
+                ("User", entry.user),
+                ("Client IP", entry.client_ip),
+                ("Time (UTC)", entry.time),
+                ("Transaction ID", entry.txn_id),
+            ]
+        ),
+    )
+
+
 def error_page(status: int, message: str, entry: LogEntry | None = None) -> str:
     rows: list[tuple[str, str | None]] = [("Status", str(status)), ("Reason", message)]
     if entry is not None:

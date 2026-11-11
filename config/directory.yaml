@@ -1,0 +1,16 @@
+# Users and groups. A stand-in for Active Directory until phase 4, when proxy
+# authentication (HTTP 407) checks users against a real directory over LDAP.
+# Phase 4 seeds the same 5 users in the same 3 groups there.
+
+users:
+  asha:   {groups: [engineering]}
+  ravi:   {groups: [engineering]}
+  meera:  {groups: [finance]}
+  kiran:  {groups: [finance]}
+  dev:    {groups: [contractors]}
+
+# Which user is behind a client IP ("IP surrogate"). Requests from IPs not
+# listed here are anonymous: only rules without users/groups apply to them.
+# Change 127.0.0.1 to another user to see their policy from this machine.
+ip_bindings:
+  127.0.0.1: asha

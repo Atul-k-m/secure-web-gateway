@@ -26,13 +26,15 @@ import ssl
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import http1, pages, tlsparse
+from . import caution, dlp, filetypes, http1, pages, tlsparse
 from .accesslog import AccessLog, LogEntry
+from .caution import CautionTracker
 from .certs import CertificateAuthority, LeafCertCache
+from .directory import ANONYMOUS, Directory, Identity
 from .http1 import HttpError, Request
 from .policy import Policy
 from .settings import Settings
@@ -305,6 +307,7 @@ class ClientConnection:
     writer: MeteredWriter
     client_ip: str
     upstreams: UpstreamPool = field(default_factory=UpstreamPool)
+    identity: Identity = ANONYMOUS  # who is behind this connection (see directory.py)
     requests: int = 0  # requests read on this connection so far
     _in_mark: int = 0
     _out_mark: int = 0
@@ -336,6 +339,7 @@ class Exchange:
     request: Request
     entry: LogEntry
     response_started: bool = False  # after this, errors can't become error pages
+    identity: Identity = ANONYMOUS
 
 
 # --------------------------------------------------------------------------
@@ -350,6 +354,7 @@ class Gateway:
         access_log: AccessLog | None = None,
         policy: Policy | None = None,
         ca: CertificateAuthority | None = None,
+        directory: Directory | None = None,
     ):
         self.settings = settings
         self.log = access_log or AccessLog(settings.access_log, echo=settings.log_to_stdout)
@@ -359,6 +364,8 @@ class Gateway:
             ca = ca or CertificateAuthority.load_or_create(settings.ca_dir, settings.public_url())
             self.certs = LeafCertCache(ca)
         self.upstream_tls = upstream_tls_context(settings.upstream_ca_file)
+        self.directory = directory or Directory.load(settings.directory_file)
+        self.caution = CautionTracker(self.policy.caution_minutes)
 
     async def start(self) -> asyncio.Server:
         return await asyncio.start_server(
@@ -367,6 +374,7 @@ class Gateway:
 
     def _new_entry(self, conn: ClientConnection, method: str, tunnel: InspectedTunnel | None = None) -> LogEntry:
         entry = LogEntry.begin(conn.client_ip, method)
+        entry.user = conn.identity.user
         if tunnel is not None:
             entry.inspected = True
             entry.host, entry.sni, entry.tls_version = tunnel.host, tunnel.sni, tunnel.tls_version
@@ -391,6 +399,7 @@ class Gateway:
         """Serve one client TCP connection, which can carry many requests."""
         peer = writer.get_extra_info("peername") or ("unknown", 0)
         conn = ClientConnection(MeteredReader(reader), MeteredWriter(writer), client_ip=peer[0])
+        conn.identity = self.directory.identify(conn.client_ip)
         try:
             await self._serve_requests(conn)
         except (OSError, asyncio.IncompleteReadError):
@@ -428,7 +437,7 @@ class Gateway:
 
     async def _handle_http(self, conn: ClientConnection, request: Request, tunnel: InspectedTunnel | None) -> bool:
         """Serve one HTTP request. Returns True to keep the connection open."""
-        ex = Exchange(request, self._new_entry(conn, request.method, tunnel))
+        ex = Exchange(request, self._new_entry(conn, request.method, tunnel), identity=conn.identity)
         keep_alive = False
         try:
             if tunnel is None and request.target.startswith("/"):
@@ -494,18 +503,40 @@ class Gateway:
         await conn.send(http1.simple_response(status, body, content_type, keep_alive=keep_alive))
         return keep_alive
 
+    async def _answer(self, conn: ClientConnection, ex: Exchange, status: int, body: str, extra_headers=()) -> bool:
+        """The gateway answers this request itself (block, caution, redirect).
+        Connection: close, so an unread request body never gets parsed as
+        the next request."""
+        ex.entry.status = status
+        ex.response_started = True
+        await conn.send(http1.simple_response(status, body, extra_headers=extra_headers))
+        return False
+
     async def _forward(self, conn: ClientConnection, ex: Exchange, target: Target) -> bool:
         request, entry = ex.request, ex.entry
+        identity = conn.identity
         entry.host, entry.url = target.host, target.url
 
-        decision = self.policy.decide(target.host)
+        # Stage 1: URL policy. Allow, warn about, or block this site, for
+        # this user. Nothing has been read from the body or sent anywhere yet.
+        decision = self.policy.decide(target.host, identity)
         entry.category, entry.rule, entry.action = decision.category, decision.rule, decision.action
         if decision.action == "block":
-            entry.status = 403
-            ex.response_started = True
-            # Connection: close, so any request body is never read.
-            await conn.send(http1.simple_response(403, pages.block_page(entry)))
-            return False
+            return await self._answer(conn, ex, 403, pages.block_page(entry))
+        if decision.action == "caution":
+            who = identity.user or conn.client_ip
+            clean_path, token = caution.split_token(target.path)
+            if token is not None:  # the user clicked "Continue" on the warning page
+                target = replace(target, path=clean_path)
+                entry.url = target.url
+                if self.caution.accept(who, target.host, token):
+                    entry.action = "caution-accepted"
+                    return await self._answer(conn, ex, 302, "", [("Location", target.url)])
+            if not self.caution.accepted(who, target.host):
+                continue_url = caution.add_token(target.url, self.caution.token(who, target.host))
+                page = pages.caution_page(entry, continue_url, self.policy.caution_minutes)
+                return await self._answer(conn, ex, 403, page)
+            entry.action = "caution-accepted"
 
         client_keep_alive = http1.wants_keep_alive(request.version, request.headers)
         body_framing = http1.request_framing(request.headers)
@@ -518,7 +549,16 @@ class Gateway:
             # The gateway answers itself and forwards without the Expect.
             await conn.send(b"HTTP/1.1 100 Continue\r\n\r\n")
 
-        # 1. Rewrite the request for the origin: origin-form target, no
+        # Stage 2: the upload. If a DLP or upload file-type rule could apply,
+        # read the body *before* anything goes to the origin, so a block
+        # means the data never left.
+        body = http1.iter_body(conn.reader, body_framing)
+        if body_framing.kind != "none" and self.policy.scans_uploads(target.host, identity):
+            body, block_page = await self._check_upload(ex, target, body)
+            if block_page is not None:
+                return await self._answer(conn, ex, 403, block_page)
+
+        # Stage 3: rewrite the request for the origin: origin-form target, no
         #    hop-by-hop headers, Host taken from the URL (RFC 9112 3.2.2),
         #    and a Via header that records the hop.
         headers = http1.strip_hop_by_hop(request.headers)
@@ -532,18 +572,36 @@ class Gateway:
             headers.set("Upgrade", upgrade)
         head = f"{request.method} {target.path} HTTP/1.1\r\n".encode("latin-1") + headers.encode()
 
-        # 2. Send it and wait for the response head (time to first byte).
+        # Stage 4: send it and wait for the response head (time to first byte).
         started = time.perf_counter()
-        upstream, response = await self._send_to_origin(conn, target, head, body_framing)
+        upstream, response = await self._send_to_origin(conn, target, head, body_framing, body)
         entry.upstream_latency_ms = ms_since(started)
         entry.status = response.status
 
         if response.status == 101 and upgrade:
             return await self._switch_protocols(conn, ex, upstream, response)
 
-        # 3. Relay the response, re-framing the body for this client.
+        # Stage 5: the download. Look at the first bytes before the client
+        # sees anything, so a blocked file can still get a block page.
+        framing = http1.response_framing(request.method, response.status, response.headers)
+        download = http1.iter_body(upstream.reader, framing)
+        if framing.kind != "none" and self.policy.has_file_rules("download"):
+            first, download = await peek(download, filetypes.SNIFF_BYTES)
+            file_type = filetypes.detect(
+                response.headers.get("Content-Type"), first, response.headers.get("Content-Encoding")
+            )
+            entry.file_type = file_type.label
+            verdict = self.policy.check_file_type(target.host, identity, file_type, "download")
+            if verdict.rule is not None:
+                entry.rule = verdict.rule  # record allow-exceptions too, not just blocks
+            if verdict.action == "block":
+                upstream.close()
+                entry.action, entry.rule = "block", verdict.rule
+                reason = f"downloading {describe_file_type(file_type)} is not allowed"
+                return await self._answer(conn, ex, 403, pages.content_block_page(entry, reason))
+
+        # Stage 6: relay the response, re-framing the body for this client.
         try:
-            framing = http1.response_framing(request.method, response.status, response.headers)
             out_headers = http1.strip_hop_by_hop(response.headers)
             out_headers.add("Via", f"{response.version[5:]} {self.settings.via_name}")
             keep_alive = client_keep_alive
@@ -561,7 +619,7 @@ class Gateway:
                 f"HTTP/1.1 {response.status} {response.reason}\r\n".encode("latin-1") + out_headers.encode()
             )
             body_out = http1.BodyWriter(conn.writer, chunked=rechunk)
-            async for chunk in http1.iter_body(upstream.reader, framing):
+            async for chunk in download:
                 await body_out.write(chunk)
             await body_out.finish()
             await conn.writer.drain()
@@ -573,7 +631,59 @@ class Gateway:
         conn.upstreams.release(upstream, reusable)
         return keep_alive
 
-    async def _send_to_origin(self, conn, target: Target, head: bytes, body_framing: http1.Framing):
+    async def _check_upload(self, ex: Exchange, target: Target, body):
+        """Read the request body (up to the scan limit), check file types and
+        DLP. Returns (body to forward, None) or (None, block page)."""
+        entry, identity = ex.entry, ex.identity
+        limit = self.policy.dlp_max_scan_bytes
+        buffered = bytearray()
+        truncated = False
+        async for chunk in body:
+            buffered += chunk
+            if len(buffered) > limit:
+                truncated = True  # scan the first `limit` bytes, pass the rest unscanned
+                break
+
+        scanned = bytes(buffered[:limit])
+        parts = dlp.extract_parts(scanned, ex.request.headers.get("Content-Type"))
+        for part in parts:
+            file_type = filetypes.detect(part.content_type, part.data[: filetypes.SNIFF_BYTES])
+            if file_type.label:
+                entry.file_type = file_type.label
+            verdict = self.policy.check_file_type(target.host, identity, file_type, "upload")
+            if verdict.rule is not None:
+                entry.rule = verdict.rule
+            if verdict.action == "block":
+                entry.action, entry.rule = "block", verdict.rule
+                name = f" ({part.filename})" if part.filename else ""
+                reason = f"uploading {describe_file_type(file_type)}{name} is not allowed"
+                return None, pages.content_block_page(entry, reason)
+
+        findings = dlp.scan_parts(parts)
+        entry.dlp = {
+            "scanned_bytes": len(scanned),
+            "truncated": truncated,
+            "matches": dlp.counts(findings),
+        }
+        if findings:
+            verdict = self.policy.check_dlp(target.host, identity, {f.detector for f in findings})
+            if verdict.rule is not None:
+                entry.rule = verdict.rule
+            if verdict.action == "block":
+                entry.action = "block"
+                hints = sorted({f.hint for f in findings})
+                reason = "this upload contains sensitive data: " + ", ".join(hints)
+                return None, pages.content_block_page(entry, reason)
+
+        async def replay():
+            yield bytes(buffered)
+            if truncated:
+                async for chunk in body:
+                    yield chunk
+
+        return replay(), None
+
+    async def _send_to_origin(self, conn, target: Target, head: bytes, body_framing: http1.Framing, body):
         """Send the request head and body; return (upstream, response head).
 
         An idle origin connection can be closed by the origin at any time.
@@ -587,7 +697,7 @@ class Gateway:
                 upstream.writer.write(head)
                 if body_framing.kind != "none":
                     body_out = http1.BodyWriter(upstream.writer, chunked=body_framing.kind == "chunked")
-                    async for chunk in http1.iter_body(conn.reader, body_framing):
+                    async for chunk in body:
                         await body_out.write(chunk)
                     await body_out.finish()
                 await upstream.writer.drain()
@@ -635,7 +745,7 @@ class Gateway:
         entry.host = host
         entry.url = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
-        decision = self.policy.decide(host)
+        decision = self.policy.decide(host, conn.identity)
         entry.category, entry.rule = decision.category, decision.rule
         if self.certs is not None and decision.inspect:
             await self._inspect(conn, entry, host, port)
@@ -731,6 +841,32 @@ class Gateway:
             self._write_log(conn, entry)  # one line per tunnel, written when it closes
 
 
+async def peek(body, size: int):
+    """Read the first `size` bytes of a body stream without losing them.
+    Returns (first bytes, a stream that yields the whole body)."""
+    buffered = b""
+    async for chunk in body:
+        buffered += chunk
+        if len(buffered) >= size:
+            break
+
+    async def whole():
+        if buffered:
+            yield buffered
+        async for chunk in body:
+            yield chunk
+
+    return buffered[:size], whole()
+
+
+def describe_file_type(file_type: filetypes.FileType) -> str:
+    """For block pages: 'a windows-executable file (sent as text/plain)'."""
+    text = f"a {file_type.label} file"
+    if file_type.mismatch:
+        text += f" (sent as {file_type.declared})"
+    return text
+
+
 async def read_first_record(reader) -> bytes:
     """Read one whole TLS record, or whatever arrived if it isn't TLS."""
     try:
@@ -792,10 +928,14 @@ async def serve(settings: Settings) -> None:
         print(f"  root CA SHA-256 {ca.fingerprint}", flush=True)
     else:
         print("TLS inspection OFF: HTTPS is tunnelled untouched", flush=True)
+    policy = gateway.policy
     print(
-        f"policy: {len(gateway.policy.rules)} URL rules, "
-        f"{len(gateway.policy.categories)} categorized domains",
+        f"policy: {len(policy.rules)} URL, {len(policy.file_rules)} file-type and "
+        f"{len(policy.dlp_rules)} DLP rules; {len(policy.categories)} categorized domains; "
+        f"{len(gateway.directory.users)} users",
         flush=True,
     )
+    for warning in policy.lint():
+        print(f"WARNING {warning}", flush=True)
     async with server:
         await server.serve_forever()

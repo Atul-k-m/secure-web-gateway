@@ -3,15 +3,19 @@
     python -m swg                  run the gateway with config/gateway.yaml
     python -m swg --no-inspect     run it with TLS inspection off
     python -m swg ca               create the inspection CA (if needed) and show it
+    python -m swg check-policy     run tests/policy_cases.yaml against the policy
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
 from pathlib import Path
 
+from . import policytest
 from .certs import CertificateAuthority
+from .policy import Policy
 from .proxy import serve
 from .settings import load_settings
 
@@ -20,8 +24,10 @@ DEFAULT_CONFIG = Path("config/gateway.yaml")
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="swg", description="Run the secure web gateway.")
-    parser.add_argument("command", nargs="?", choices=["run", "ca"], default="run",
-                        help="run the gateway (default), or create/show the inspection CA")
+    parser.add_argument("command", nargs="?", choices=["run", "ca", "check-policy"], default="run",
+                        help="run the gateway (default), create/show the CA, or test the policy")
+    parser.add_argument("cases", nargs="?", type=Path, default=Path("tests/policy_cases.yaml"),
+                        help="for check-policy: the cases file")
     parser.add_argument("--config", type=Path, default=None,
                         help=f"settings file (default {DEFAULT_CONFIG} if it exists)")
     parser.add_argument("--host", help="address to listen on")
@@ -52,6 +58,15 @@ def main(argv: list[str] | None = None) -> None:
         print(f"SHA-256          : {ca.fingerprint}")
         print("Install it as a trusted root: see docs/how-it-works.md, section 8.")
         return
+
+    if args.command == "check-policy":
+        policy = Policy.load(settings.policy_file, settings.categories_file)
+        for warning in policy.lint():
+            print(f"WARNING  {warning}")
+        results = policytest.run(args.cases, settings.policy_file, settings.categories_file,
+                                 settings.directory_file)
+        print(policytest.report(results))
+        sys.exit(0 if all(r.passed for r in results) else 1)
 
     try:
         asyncio.run(serve(settings))

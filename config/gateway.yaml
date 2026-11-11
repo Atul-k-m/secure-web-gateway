@@ -22,3 +22,4 @@ tls_inspection:
 
 policy_file: config/policy.yaml
 categories_file: config/categories.yaml
+directory_file: config/directory.yaml    # users and groups until phase 4

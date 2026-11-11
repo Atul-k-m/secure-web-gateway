@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# Runtime output
+logs/
+
+# Private keys and generated certificates (the inspection CA arrives in phase 2)
+*.key
+ca/

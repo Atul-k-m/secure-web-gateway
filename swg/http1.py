@@ -42,6 +42,7 @@ REASONS = {
     405: "Method Not Allowed",
     407: "Proxy Authentication Required",
     413: "Content Too Large",
+    421: "Misdirected Request",
     431: "Request Header Fields Too Large",
     501: "Not Implemented",
     502: "Bad Gateway",
@@ -338,13 +339,13 @@ def wants_keep_alive(version: str, headers: Headers) -> bool:
 
 def simple_response(
     status: int,
-    body: str,
+    body: str | bytes,
     content_type: str = "text/html; charset=utf-8",
     extra_headers: Iterable[tuple[str, str]] = (),
     keep_alive: bool = False,
 ) -> bytes:
     """A complete response the gateway generates itself (errors, info pages)."""
-    payload = body.encode("utf-8")
+    payload = body.encode("utf-8") if isinstance(body, str) else body
     headers = Headers(
         [
             ("Content-Type", content_type),

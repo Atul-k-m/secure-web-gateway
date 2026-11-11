@@ -8,6 +8,7 @@ JSON lines. See docs/how-it-works.md for what each field means.
 from __future__ import annotations
 
 import json
+import secrets
 import sys
 import threading
 import time
@@ -23,14 +24,17 @@ def utc_now_iso() -> str:
 @dataclass
 class LogEntry:
     time: str
+    txn_id: str  # shown on block and error pages, so a ticket can quote it
     client_ip: str
     user: str | None = None  # filled in by proxy authentication (phase 4)
     method: str = ""
     host: str | None = None
     url: str | None = None
     status: int | None = None
-    category: str | None = None  # filled in by the policy engine (phase 3)
-    action: str = "allow"
+    category: str | None = None  # URL category from config/categories.yaml
+    rule: str | None = None  # policy rule that decided; None = default action
+    action: str = "allow"  # allow / block
+    inspected: bool = False  # True when the gateway decrypted this HTTPS request
     bytes_in: int = 0  # bytes the gateway read from the client
     bytes_out: int = 0  # bytes the gateway wrote to the client
     upstream_latency_ms: float | None = None
@@ -41,7 +45,7 @@ class LogEntry:
 
     @classmethod
     def begin(cls, client_ip: str, method: str = "") -> "LogEntry":
-        entry = cls(time=utc_now_iso(), client_ip=client_ip, method=method)
+        entry = cls(time=utc_now_iso(), txn_id=secrets.token_hex(6), client_ip=client_ip, method=method)
         entry._started = time.perf_counter()
         return entry
 

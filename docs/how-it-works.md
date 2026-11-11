@@ -16,7 +16,7 @@ Sections are written as each phase lands:
 | [5. TLS 1.2 and TLS 1.3 handshakes](#5-tls-12-and-tls-13-handshakes) | 1 | written |
 | [6. SNI](#6-sni-server-name-indication) | 1 | written |
 | [7. The access log](#7-the-access-log) | 1 | written |
-| [8. Certificate chains and TLS inspection](#8-certificate-chains-and-tls-inspection) | 2 | to do |
+| [8. Certificate chains and TLS inspection](#8-certificate-chains-and-tls-inspection) | 2 | written |
 | [9. Proxy authentication: HTTP 407](#9-proxy-authentication-http-407) | 4 | to do |
 | [10. LDAP bind](#10-ldap-bind) | 4 | to do |
 | [11. SAML 2.0 single sign-on](#11-saml-20-single-sign-on) | 4 | to do |
@@ -115,13 +115,13 @@ once. The `502` tests in `tests/` take about 2 s each on Windows for this
 reason.
 
 A name can resolve to IPv6 and IPv4 addresses. If IPv6 is broken on a network,
-trying it first stalls every request. `open_tcp` uses Happy Eyeballs (RFC 8305):
+trying it first stalls every request. `open_upstream` uses Happy Eyeballs (RFC 8305):
 if the first address hasn't connected after 250 ms, it starts the next one in
 parallel. (While building this, `localhost` resolved to `::1` first while the
 test server listened only on IPv4. Each HTTPS test waited 2.3 s until Happy
 Eyeballs fixed it.)
 
-Code: `open_tcp` in `swg/proxy.py`.
+Code: `open_upstream` in `swg/proxy.py`.
 
 > **[Wireshark screenshot 1: TCP handshake to the gateway]**
 > Capture on: loopback. Filter: `tcp.port == 3128 && tcp.flags.syn == 1`.
@@ -239,8 +239,14 @@ Error pages HTML-escape everything they show, because the message can contain
 client input such as a host name (`pages.error_page`). There is a test for it.
 
 A request in origin-form (`GET / HTTP/1.1`) is addressed to the gateway
-itself, not to be forwarded. The gateway answers with an info page. Phase 6
-serves the PAC file from the same place (`Gateway._serve_local`).
+itself, not to be forwarded (`Gateway._serve_local`). The gateway serves:
+
+| Path | What |
+|---|---|
+| `/` | info page |
+| `/ca.crt` | the inspection root CA, for installing on a device (section 8.7) |
+| `/crl/root.crl`, `/crl/issuing.crl` | certificate revocation lists (section 8.3) |
+| `/proxy.pac` | the PAC file (phase 6) |
 
 > **[Wireshark screenshot 3: absolute-form request to the proxy]**
 > Capture on: loopback. Filter: `tcp.port == 3128 && http`.
@@ -291,8 +297,8 @@ bytes in both directions (`relay` in `swg/proxy.py`) until one side finishes:
 | SNI and TLS version (section 6) | request and response headers, cookies |
 | bytes each way, timing | request and response bodies |
 
-The right-hand column is why SWGs do TLS inspection (phase 2): you can't apply
-URL policy, scan downloads or run DLP on bytes you can't read.
+The right-hand column is why SWGs do TLS inspection (section 8): you can't
+apply URL policy, scan downloads or run DLP on bytes you can't read.
 
 ### One log line per tunnel
 
@@ -303,8 +309,10 @@ only the tunnel, so it writes **one log line when the tunnel closes**:
 * `bytes_in` / `bytes_out` count every TLS byte that crossed it.
 * `upstream_latency_ms` is the DNS + TCP connect time to the origin.
 
-After TLS inspection (phase 2), inspected traffic gets one line per HTTPS
-request again.
+With TLS inspection (section 8) the gateway reads the requests inside the
+tunnel, so inspected HTTPS gets one line per request, like plain HTTP. Only
+tunnels left untouched (inspection off, or Do-Not-Inspect) still log one line
+per tunnel.
 
 CONNECT is a generic TCP tunnel. Anything can go through it, for example SSH
 on port 22. Real SWGs therefore usually allow CONNECT to port 443 only. This
@@ -485,30 +493,35 @@ Details:
 ## 7. The access log
 
 Every request writes one JSON object on one line to `logs/access.log`
-(`swg/accesslog.py`). Example, from a real run:
+(`swg/accesslog.py`). Two real lines, an inspected HTTPS request and a
+Do-Not-Inspect tunnel:
 
 ```json
-{"time":"2026-11-11T14:24:40.267Z","client_ip":"127.0.0.1","user":null,"method":"CONNECT","host":"example.com","url":"example.com:443","status":200,"category":null,"action":"allow","bytes_in":590,"bytes_out":5801,"upstream_latency_ms":5.93,"duration_ms":193.29,"tls_version":"TLSv1.3","sni":"example.com","error":null}
+{"time":"2026-11-11T17:41:37.844Z","txn_id":"685773d842be","client_ip":"127.0.0.1","user":null,"method":"GET","host":"github.com","url":"https://github.com/","status":200,"category":"developer-tools","rule":null,"action":"allow","inspected":true,"bytes_in":73,"bytes_out":531752,"upstream_latency_ms":378.98,"duration_ms":609.6,"tls_version":"TLSv1.3","sni":"github.com","error":null}
+{"time":"2026-11-11T17:42:00.325Z","txn_id":"4e3dd8153f5a","client_ip":"127.0.0.1","user":null,"method":"CONNECT","host":"www.paypal.com","url":"www.paypal.com:443","status":200,"category":"finance","rule":null,"action":"allow","inspected":false,"bytes_in":496,"bytes_out":5693,"upstream_latency_ms":113.62,"duration_ms":2196.21,"tls_version":"TLSv1.3","sni":"www.paypal.com","error":null}
 ```
 
 | Field | Meaning |
 |---|---|
 | `time` | UTC time the request head was fully received |
+| `txn_id` | random ID for this transaction, also printed on block and error pages. A user quotes it in a ticket; support runs `Select-String <txn_id> logs\access.log`. |
 | `client_ip` | the client's address, as seen by the gateway |
 | `user` | authenticated user, from phase 4. `null` until then. |
 | `method` | `GET`, `POST`, `CONNECT`, ... |
 | `host` | destination host name (lower-cased) |
-| `url` | full URL for HTTP, `host:port` for CONNECT tunnels |
+| `url` | full URL for HTTP and inspected HTTPS, `host:port` for an untouched tunnel |
 | `status` | status the gateway sent to the client (the origin's, or the gateway's own 4xx/5xx) |
-| `category` | URL category, from phase 3. `null` until then. |
-| `action` | `allow` for now. Phase 3 adds `block` and `caution`. |
-| `bytes_in` | bytes the gateway **read from the client** for this request: request line, headers and body as sent on the wire. For a tunnel, every byte the client sent. |
-| `bytes_out` | bytes the gateway **wrote to the client**: status line, headers and body |
-| `upstream_latency_ms` | HTTP: from starting the origin connection (or reusing one) to receiving the response head, i.e. connect time plus time to first byte. CONNECT: DNS + TCP connect only. |
+| `category` | URL category from `config/categories.yaml`, or `null` if uncategorized |
+| `rule` | name of the policy rule that decided, `null` when the default action applied |
+| `action` | `allow` or `block` (phase 3 adds `caution`) |
+| `inspected` | `true` when the gateway decrypted this HTTPS request (section 8) |
+| `bytes_in` | bytes the gateway **read from the client** for this request: request line, headers and body. For an inspected request these are the decrypted HTTP bytes. For an untouched tunnel, every TLS byte the client sent. |
+| `bytes_out` | bytes the gateway **wrote to the client**: status line, headers and body (decrypted, for inspected requests) |
+| `upstream_latency_ms` | HTTP and inspected HTTPS: from starting the origin connection (or reusing one) to receiving the response head, i.e. connect (+ TLS handshake) plus time to first byte. Untouched tunnel: DNS + TCP connect only. |
 | `duration_ms` | from request head received to log written. For tunnels, how long the tunnel was open. |
-| `tls_version` | version the server chose, from the ServerHello. `null` for plain HTTP. |
-| `sni` | server name from the ClientHello. `null` for plain HTTP or IP-only HTTPS. |
-| `error` | why a request failed (connect refused, timeout, ...), else `null` |
+| `tls_version` | untouched tunnel: what the origin chose, from its ServerHello. Inspected: what the client and the gateway negotiated. `null` for plain HTTP. |
+| `sni` | server name from the client's ClientHello. `null` for plain HTTP or IP-only HTTPS. |
+| `error` | why a request failed (connect refused, timeout, bad origin certificate, client rejected our certificate, ...), else `null` |
 
 Reading the log on Windows without extra tools:
 
@@ -530,7 +543,360 @@ With `jq` (Linux, macOS, Git Bash): `jq -c 'select(.status >= 500)' logs/access.
 
 ## 8. Certificate chains and TLS inspection
 
-*Written in phase 2.*
+### 8.1 Certificate chains
+
+A certificate binds a public key to names. It holds a subject, a list of
+names (the **subjectAltName**, SAN), validity dates, the **issuer**'s name,
+and the issuer's signature over all of that. A client trusts a certificate if
+it can build a **chain** from it up to a root it already trusts:
+
+```
+leaf          example.com                         sent by the server
+  issued by   Cloudflare TLS Issuing ECC CA 3     sent by the server (intermediate)
+  issued by   SSL.com TLS Transit ECC CA R2       sent by the server (intermediate)
+  issued by   SSL.com TLS ECC Root CA 2022        already in the client's trust store (root)
+```
+
+That is example.com's real chain, from
+`openssl s_client -connect example.com:443 -servername example.com`.
+
+For each link, the client checks (RFC 5280, simplified):
+
+1. **Signature:** each certificate is signed by the key of the one above it.
+2. **Dates:** now is between `notBefore` and `notAfter`.
+3. **CA rights:** every issuer has `BasicConstraints: CA:TRUE` and the
+   `keyCertSign` key usage, and the chain isn't longer than its
+   `pathLenConstraint` allows.
+4. **Name:** the host name matches a SAN entry, a DNS name or an IP address.
+   The subject CN is ignored by modern clients.
+5. **Purpose:** the leaf's Extended Key Usage includes `serverAuth`.
+6. **Revocation:** if the client checks it, no certificate in the chain is
+   listed on its CA's CRL (or OCSP says "good"). See 8.3.
+
+The root is never sent; it's a **trust anchor**, already in the client's
+store. Common errors and what they mean:
+
+| Error (OpenSSL wording) | Cause |
+|---|---|
+| `unable to get local issuer certificate` | the chain doesn't reach a trusted root: a missing intermediate, or an unknown root (e.g. the SWG's root isn't installed) |
+| `self-signed certificate` | the server sent a root it made itself |
+| `certificate has expired` | dates |
+| `Hostname mismatch` | no SAN matches the name the client asked for |
+
+The gateway shows all of these to users on its error page. The tests and
+the live run above (expired, wrong.host and self-signed badssl.com) produced
+exactly these messages.
+
+Code: `tests/test_certs.py` validates minted chains with `cryptography`'s
+RFC 5280 path builder, the same checks a browser does.
+
+### 8.2 How inspection works
+
+TLS was built so that nobody in the middle can read it. A SWG reads it
+anyway, with the organisation's consent: the organisation installs the
+SWG's root CA on its devices, and the SWG then acts as the server towards
+the client and as the client towards the server. There are **two separate
+TLS sessions**:
+
+```
+browser ═══ TLS #1 ═══════════════════► gateway ═══ TLS #2 ══════════════════► origin
+        cert: example.com                        cert: the real example.com cert
+        issued by SWG Inspection Issuing CA      verified by the gateway against
+        (trusted because the root is installed)  the OS trust store
+```
+
+Step by step (`Gateway._handle_connect` → `_inspect`):
+
+1. `CONNECT example.com:443` arrives. The policy decides: inspect, or leave
+   it alone (Do-Not-Inspect, 8.4)?
+2. The gateway answers `200 Connection established`.
+3. The client sends its ClientHello. OpenSSL calls the gateway's **SNI
+   callback** (`LeafCertCache._on_sni`) with the name from it. The gateway
+   looks up a certificate for that name, or mints one, and switches the
+   handshake to it. Minting takes **1.96 ms** (median of 300 hosts, p95
+   3.64 ms, measured on this Windows laptop); a cache hit takes about 1 µs.
+4. The gateway completes the handshake as the server. It offers only
+   `http/1.1` in ALPN, so a browser that would use HTTP/2 falls back to 1.1.
+5. The client sends HTTP inside TLS #1, and the gateway reads it like plain
+   HTTP. The policy runs again for every request, and every request gets its
+   own log line with `"inspected": true`.
+6. For each request the gateway opens (or reuses) TLS #2 to the origin and
+   **verifies the origin's certificate**. The client can no longer see that
+   certificate, so the gateway has to reject a bad one on its behalf, with
+   the "certificate could not be verified" page.
+
+What the client sees, from
+`openssl s_client -proxy 127.0.0.1:3128 -connect example.com:443 -CAfile ca/swg-root-ca.crt -showcerts`:
+
+```
+ 0 s:CN = example.com
+   i:CN = SWG Inspection Issuing CA, O = secure-web-gateway
+ 1 s:CN = SWG Inspection Issuing CA, O = secure-web-gateway
+   i:CN = SWG Inspection Root CA, O = secure-web-gateway
+Verify return code: 0 (ok)
+```
+
+The gateway's CA (`swg/certs.py`, files in `ca/`):
+
+| | Root CA | Issuing CA | Leaf (minted) |
+|---|---|---|---|
+| Lifetime | 10 years | 5 years | 30 days, backdated 1 day for clients with slow clocks |
+| BasicConstraints | CA, pathlen 1 | CA, pathlen 0 | not a CA |
+| Key | EC P-256 | EC P-256 | EC P-256, **one key shared by all leaves** |
+| CRL link | none (trust anchor) | `/crl/root.crl` | `/crl/issuing.crl` |
+| Where | installed on clients | sent with every leaf | sent to the client |
+
+Why an intermediate: the root key is needed only to create the intermediate,
+so in a real deployment it can live offline. Why one shared leaf key:
+generating a key pair is the slow part of minting; reusing one makes minting
+a single signature. mitmproxy does the same. The price is that the leaf key
+and the issuing CA key are as sensitive as the root: anyone who holds them
+can impersonate **any** website to every client that trusts the root. That
+is why commercial SWGs keep them in hardware security modules.
+
+> **[Wireshark screenshot 9: the minted certificate]**
+> Capture on: loopback. Filter: `tls.handshake.type == 11` (Certificate).
+> Run `curl.exe --tls-max 1.2 --cacert ca\swg-root-ca.crt -x http://127.0.0.1:3128 https://example.com/`
+> (TLS 1.2, so the Certificate message is not encrypted). Expand the
+> certificate and highlight issuer `SWG Inspection Issuing CA`, the
+> subjectAltName and the CRL Distribution Point.
+
+> **[Wireshark screenshot 10: two TLS sessions for one request]**
+> Capture on loopback *and* Wi-Fi together (Capture → Options, select both).
+> Filter: `tls.handshake.type == 1`. Same curl command. Show two
+> ClientHellos for example.com: one from curl to port 3128, one from the
+> gateway to port 443. They are different handshakes with different random
+> values.
+
+To decrypt both sessions in Wireshark, start the gateway with
+`$env:SSLKEYLOGFILE = "D:\swg-keys.log"; python -m swg`. The gateway writes
+the session keys of both TLS legs to that file. Point Wireshark at it
+(Preferences → Protocols → TLS → (Pre)-Master-Secret log filename). This is
+for debugging only: the file decrypts everything.
+
+> **[Wireshark screenshot 11: decrypted HTTP on both legs]**
+> With the key log loaded, filter `http`. Show the same `GET /` once on the
+> loopback leg (from curl) and once on the Wi-Fi leg (from the gateway, with
+> `Via: 1.1 swg`).
+
+### 8.3 Revocation, and a Windows surprise
+
+A CA can **revoke** a certificate before it expires, for example if its key
+leaked. Clients find out through a **CRL** (a signed list of revoked serial
+numbers, at a URL named in the certificate's *CRL Distribution Points*
+extension) or through **OCSP** (ask a responder about one certificate).
+
+Browsers mostly rely on revocation lists their vendor pushes to them, and
+let the connection through if an online check fails. Windows' TLS library
+(Schannel) checks revocation whenever the app asks it to, and the built-in
+`curl.exe` asks by default. The first version of the gateway minted
+certificates without a CRL link, and this happened (real output):
+
+```
+> curl.exe --cacert ca\swg-root-ca.crt -x http://127.0.0.1:3128 https://example.com/
+curl: (60) schannel: CertGetCertificateChain trust error CERT_TRUST_REVOCATION_STATUS_UNKNOWN
+```
+
+The chain was trusted, but Windows couldn't find out whether it was revoked,
+and treats "unknown" as a failure. `--ssl-no-revoke` hides the problem; it
+doesn't fix it. The fix is what enterprise CAs do: put a CRL Distribution
+Point in every certificate below the root, and publish the CRLs. The gateway
+serves them itself, at the URL in `gateway_url` (`config/gateway.yaml`):
+
+* the issuing CA's certificate points to `/crl/root.crl`, signed by the root
+* every leaf points to `/crl/issuing.crl`, signed by the issuing CA
+* both are empty (nothing revoked), valid for 7 days, re-signed hourly
+
+After the change the same command returns 200, and the access log shows
+Windows fetching both lists by itself before the request:
+
+```
+GET  /crl/root.crl          200
+GET  /crl/issuing.crl       200
+GET  https://example.com/   200   inspected
+```
+
+If the gateway's address changes, the intermediate is re-issued with the new
+CRL URL. The root stays the same, so clients don't need to reinstall anything
+(`test_crl_links_point_back_at_the_gateway`).
+
+> **[Wireshark screenshot 12: Windows fetching the CRL]**
+> Capture on: loopback. Filter: `http.request.uri contains "crl"`.
+> Run `certutil -urlcache crl delete` first so Windows hasn't cached the CRL,
+> then the curl command above. Highlight the GET for `/crl/issuing.crl` and
+> the `application/pkix-crl` response.
+
+### 8.4 Do-Not-Inspect
+
+Some traffic must not be decrypted:
+
+* **Certificate pinning.** The app ships with the certificate or public-key
+  hash it expects and refuses anything else, even a certificate from a
+  trusted root. Banking apps, messengers (Signal, WhatsApp), and OS update
+  and push services do this. Under inspection they simply stop working.
+* **Privacy and law.** Many organisations choose not to read banking or
+  health traffic.
+* **Client certificates (mutual TLS).** The client proves its identity with
+  its own certificate and key, which the gateway doesn't have, so TLS #2
+  can't present it. Sites that need it must be exempted.
+
+`config/policy.yaml` lists exemptions by domain and by category:
+
+```yaml
+ssl_inspection:
+  do_not_inspect:
+    domains: [signal.org, whatsapp.net, swcdn.apple.com]
+    categories: [finance, health]
+```
+
+An exempt CONNECT becomes a blind tunnel (section 4), logged with
+`"inspected": false`. The client gets the site's real certificate. With
+PayPal (category `finance`), the client sees `DigiCert EV RSA CA G2`, not
+the gateway's CA.
+
+How a pinning failure shows up in the log, so you know to add an exemption:
+
+| Log `error` | What happened |
+|---|---|
+| `client rejected the gateway certificate (TLSV1_ALERT_UNKNOWN_CA)` | the client aborted the handshake: its root store lacks our CA, or it pins |
+| `client TLS handshake failed (DECRYPTION_FAILED_OR_BAD_RECORD_MAC)` | how a Windows Schannel client that doesn't trust the root looks from the gateway (seen with `curl.exe` before the CA was trusted) |
+| `TLS handshake completed but the client sent no request` | the handshake worked, then the app hung up. Many pinning libraries check the pin only *after* the handshake. (An unused browser preconnect looks the same, so look for repeats.) |
+
+> **[Wireshark screenshot 13: a Do-Not-Inspect tunnel keeps the real certificate]**
+> Capture on: loopback. Filter: `tls.handshake.type == 11`.
+> Run `curl.exe --tls-max 1.2 -x http://127.0.0.1:3128 https://www.paypal.com/`.
+> Highlight issuer `DigiCert`, compared with screenshot 9.
+
+### 8.5 Block pages for HTTP and HTTPS
+
+| Traffic | What the gateway can do | What the user sees |
+|---|---|---|
+| HTTP | answer the request itself with `403` and a block page | the block page |
+| HTTPS, inspected | finish TLS with a minted certificate, then answer every request with the block page. The origin is never contacted, not even DNS. | the block page, with a valid padlock |
+| HTTPS, not inspected | refuse the CONNECT with `403` | the browser's own error (`ERR_TUNNEL_CONNECTION_FAILED` in Chrome). Browsers don't display a proxy's CONNECT error body. |
+
+The last row is the reason SWGs inspect even sites they're going to block:
+without decrypting, they can't explain anything to the user.
+
+A block page shows the URL, category, rule, client IP, time and transaction
+ID (`pages.block_page`). Everything on it is HTML-escaped, because the URL is
+attacker-controlled; `test_block_page_escapes_the_url` checks it.
+
+> **[Wireshark screenshot 14: HTTPS block page]**
+> With `SSLKEYLOGFILE` set as in 8.2, open `https://www.bet365.com/` in a
+> browser that trusts the root. Filter `http.response.code == 403`. Show that
+> no packet went to bet365's servers: the only DNS or TCP traffic is to the
+> gateway.
+
+### 8.6 What inspection changes for the origin
+
+The origin no longer talks to the browser. It talks to the gateway, and
+that is visible:
+
+* **Source IP**: the gateway's address.
+* **HTTP/1.1** instead of HTTP/2, because of the ALPN restriction.
+* **TLS fingerprint.** Bot-detection services fingerprint the ClientHello
+  (cipher order, extensions; known as JA3/JA4). Under inspection they see
+  the gateway's TLS library, not Chrome's. This broke a real site during
+  testing. `www.wikipedia.org` answered `403 Please respect our robot
+  policy` through the gateway, even with a browser User-Agent, but `200`
+  directly. Varying one thing at a time narrowed it to a single ClientHello
+  extension: with `post_handshake_auth` (which Python's own `http.client`
+  enables) Wikipedia answered 200, without it 403, twice each. The gateway
+  now enables it (`upstream_tls_context`). The lesson for tickets: "the site
+  works off-network but not through the SWG", with no certificate error,
+  can be bot management reacting to the proxy's fingerprint. The usual fix
+  is a Do-Not-Inspect exemption.
+* **Host must match the tunnel.** Inside a tunnel opened with
+  `CONNECT a.com`, a request with `Host: b.com` gets `421 Misdirected
+  Request`. Otherwise a client could get policy checked for one site and
+  reach another (domain fronting).
+* **WebSockets** (`Upgrade: websocket`, then `101 Switching Protocols`)
+  pass through: after the 101 the gateway relays raw bytes both ways, as in
+  a tunnel (`Gateway._switch_protocols`).
+
+### 8.7 Installing the root CA
+
+Every client that goes through the gateway with inspection on must trust
+`ca/swg-root-ca.crt` (a PEM file). Print its location and fingerprint:
+
+```powershell
+python -m swg ca
+# root certificate : D:\secure-web-gateway\ca\swg-root-ca.crt
+# SHA-256          : 1E:4B:CF:76:...
+```
+
+Another device can download it from the running gateway:
+`http://<gateway>:3128/ca.crt`. Before trusting it, compare the SHA-256
+fingerprint with the one `python -m swg ca` printed. Installing a root CA
+lets its owner read that device's HTTPS, so only install one you control.
+
+**Windows** (Chrome, Edge, curl.exe and most apps use the Windows store):
+
+```powershell
+# current user, no admin rights needed (Windows asks you to confirm)
+certutil -user -addstore Root ca\swg-root-ca.crt
+# or the whole machine, from an elevated prompt
+certutil -addstore -f Root ca\swg-root-ca.crt
+# PowerShell equivalent
+Import-Certificate -FilePath ca\swg-root-ca.crt -CertStoreLocation Cert:\CurrentUser\Root
+
+# check, and remove
+certutil -user -store Root "SWG Inspection Root CA"
+certutil -user -delstore Root "SWG Inspection Root CA"
+```
+
+By hand: double-click the `.crt` → Install Certificate → place it in
+"Trusted Root Certification Authorities". Companies push the root to every
+laptop with Group Policy (Computer Configuration → Windows Settings →
+Security Settings → Public Key Policies → Trusted Root Certification
+Authorities) or Intune, which is how SWG vendors deploy theirs.
+
+**macOS** (Safari, Chrome and most apps use the System keychain):
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain swg-root-ca.crt
+# check, and remove
+security find-certificate -c "SWG Inspection Root CA" -Z /Library/Keychains/System.keychain
+sudo security delete-certificate -c "SWG Inspection Root CA" /Library/Keychains/System.keychain
+```
+
+By hand: Keychain Access → System keychain → drag the file in →
+double-click it → Trust → "When using this certificate: Always Trust".
+
+**Linux** (curl, wget, Python's ssl and most CLI tools read the system bundle):
+
+```bash
+# Debian / Ubuntu: the file must end in .crt
+sudo cp swg-root-ca.crt /usr/local/share/ca-certificates/swg-root-ca.crt
+sudo update-ca-certificates
+# remove: delete the file, then
+sudo update-ca-certificates --fresh
+
+# RHEL / Fedora / Rocky
+sudo cp swg-root-ca.crt /etc/pki/ca-trust/source/anchors/
+sudo update-ca-trust
+```
+
+**Apps with their own trust store.** These generate most "certificate not
+trusted" tickets after a rollout, because installing the root in the OS
+doesn't reach them:
+
+| App | How to trust the root |
+|---|---|
+| Firefox | Settings → Privacy & Security → Certificates → View Certificates → Authorities → Import. Or set `security.enterprise_roots.enabled` to `true` in `about:config` to use the OS store. |
+| Python `requests` | uses the `certifi` bundle: set `REQUESTS_CA_BUNDLE=/path/to/bundle.pem`, a bundle that includes the root |
+| Node.js | `NODE_EXTRA_CA_CERTS=/path/to/swg-root-ca.crt` |
+| Java | `keytool -importcert -cacerts -storepass changeit -alias swg-root -file swg-root-ca.crt` |
+| Git for Windows | `git config --global http.sslBackend schannel` (use the Windows store) |
+| Docker containers | copy the root into the image and run `update-ca-certificates` in the Dockerfile |
+
+> **[Wireshark screenshot 15: the client refusing an untrusted root]**
+> Capture on: loopback. Filter: `tcp.port == 3128 && (tls.alert_message || tcp.flags.reset == 1 || tcp.flags.fin == 1)`.
+> Run the curl command from 8.3 *without* `--cacert`, before installing the
+> root, with `--tls-max 1.2` so alerts aren't encrypted. Show how the client
+> ends the handshake (an alert, or a FIN/RST right after the server's
+> Certificate). Then show the gateway's log line for the same attempt.
 
 ## 9. Proxy authentication: HTTP 407
 

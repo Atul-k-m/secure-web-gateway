@@ -1,0 +1,24 @@
+# Gateway settings. Paths are relative to the folder you start the gateway
+# from (the repository root). Command-line flags override these values.
+
+listen:
+  host: 127.0.0.1
+  port: 3128
+
+access_log: logs/access.log
+
+timeouts:            # seconds
+  connect: 10        # DNS + TCP (+ TLS) to the origin
+  client_idle: 60    # keep-alive wait for the client's next request
+  tunnel_idle: 300   # CONNECT tunnel with no traffic either way
+  tls_handshake: 10
+
+tls_inspection:
+  enabled: true
+  ca_dir: ca                 # root CA, issuing CA, minted leaf certificates
+  # Extra CA bundle to trust when verifying origin servers, on top of the
+  # operating system's store. Leave empty for normal use.
+  upstream_ca_file:
+
+policy_file: config/policy.yaml
+categories_file: config/categories.yaml

@@ -1,0 +1,30 @@
+# Gateway policy. Rules are checked top to bottom; the first match wins.
+
+ssl_inspection:
+  # Traffic here is tunnelled untouched: never decrypted, never re-signed.
+  # Use it for apps that pin their certificates (they refuse the gateway's
+  # certificate and break) and for categories you choose not to read for
+  # privacy reasons, such as banking and health.
+  do_not_inspect:
+    domains:
+      - signal.org          # Signal pins its certificates
+      - whatsapp.net        # WhatsApp media and chat servers
+      - swcdn.apple.com     # Apple software updates
+    categories:
+      - finance
+      - health
+
+url_filtering:
+  default_action: allow
+  rules:
+    - name: Block gambling
+      categories: [gambling]
+      action: block
+
+    - name: Block known-malicious test pages
+      categories: [security-test]
+      action: block
+
+    - name: Block example domain
+      domains: [example.net]
+      action: block

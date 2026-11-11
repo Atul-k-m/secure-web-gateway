@@ -4,16 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "secure-web-gateway"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small Secure Web Gateway: explicit forward proxy, TLS inspection, policy, proxy auth and DNS security."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["cryptography>=42", "pyyaml>=6"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "cryptography>=42"]
+dev = ["pytest>=8"]
 
 [project.scripts]
 swg = "swg.__main__:main"

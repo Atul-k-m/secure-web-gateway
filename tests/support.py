@@ -143,6 +143,18 @@ class OriginHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"body ends at close")
             self.close_connection = True
+        elif self.path == "/upgrade":
+            # A minimal protocol switch, shaped like a WebSocket handshake:
+            # answer 101, then echo the next bytes back in upper case.
+            if self.headers.get("Upgrade", "").lower() != "echo":
+                self._send(400, b"expected Upgrade: echo")
+                return
+            self.send_response(101)
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Upgrade", "echo")
+            self.end_headers()
+            self.wfile.write(self.rfile.read1(65536).upper())
+            self.close_connection = True
         elif self.path.startswith("/bytes/"):
             self._send(200, b"x" * int(self.path.rsplit("/", 1)[1]))
         else:
@@ -189,10 +201,10 @@ class OriginServer:
 
 
 class GatewayThread:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, policy=None, ca=None):
         self.settings = settings
         self.log = AccessLog(settings.access_log, echo=False)
-        self.gateway = Gateway(settings, self.log)
+        self.gateway = Gateway(settings, self.log, policy=policy, ca=ca)
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self._ready = threading.Event()
@@ -242,6 +254,38 @@ class GatewayThread:
             if len(lines) >= count or time.monotonic() > deadline:
                 return [json.loads(line) for line in lines]
             time.sleep(0.02)
+
+
+def connect_tunnel(gateway: "GatewayThread", authority: str, timeout: float = 10) -> socket.socket:
+    """Open a CONNECT tunnel through the gateway; return the raw socket."""
+    sock = gateway.raw_socket(timeout)
+    sock.sendall(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode())
+    head = read_head(sock)
+    if not head.startswith(b"HTTP/1.1 200"):
+        sock.close()
+        status_line = head.split(b"\r\n")[0].decode()
+        raise OSError(f"tunnel refused: {status_line}")
+    return sock
+
+
+def read_head(sock) -> bytes:
+    """Read a response head byte by byte, so nothing after it is consumed."""
+    head = b""
+    while b"\r\n\r\n" not in head:
+        data = sock.recv(1)
+        if not data:
+            break
+        head += data
+    return head
+
+
+def issuer_cn(cert: dict) -> str:
+    """Issuer common name from ssl's getpeercert() dict."""
+    for rdn in cert["issuer"]:
+        for key, value in rdn:
+            if key == "commonName":
+                return value
+    return ""
 
 
 def recv_all(sock: socket.socket) -> bytes:

@@ -1,0 +1,107 @@
+# URL categories: a small, hand-curated seed list.
+#
+# A domain covers its subdomains: "bbc.co.uk" also matches "www.bbc.co.uk".
+# When a host matches more than one entry, the most specific one wins, so
+# "mail.google.com" is webmail even though "google.com" is search.
+# Commercial SWGs classify hundreds of millions of URLs; this list is only
+# big enough to demonstrate policy.
+
+search:
+  - google.com
+  - bing.com
+  - duckduckgo.com
+
+webmail:
+  - mail.google.com
+  - outlook.live.com
+  - mail.yahoo.com
+  - proton.me
+
+social-media:
+  - facebook.com
+  - instagram.com
+  - x.com
+  - twitter.com
+  - linkedin.com
+  - reddit.com
+  - tiktok.com
+
+messaging:
+  - whatsapp.com
+  - whatsapp.net
+  - signal.org
+  - telegram.org
+  - discord.com
+
+news:
+  - bbc.com
+  - bbc.co.uk
+  - reuters.com
+  - nytimes.com
+  - thehindu.com
+  - ndtv.com
+
+finance:
+  - paypal.com
+  - razorpay.com
+  - zerodha.com
+  - hdfcbank.com
+  - icicibank.com
+  - onlinesbi.sbi
+  - chase.com
+
+health:
+  - who.int
+  - nih.gov
+  - mayoclinic.org
+  - webmd.com
+  - practo.com
+
+streaming:
+  - youtube.com
+  - googlevideo.com
+  - netflix.com
+  - hotstar.com
+  - spotify.com
+  - twitch.tv
+
+file-sharing:
+  - dropbox.com
+  - wetransfer.com
+  - mega.nz
+  - mediafire.com
+
+generative-ai:
+  - chatgpt.com
+  - openai.com
+  - claude.ai
+  - gemini.google.com
+  - perplexity.ai
+
+developer-tools:
+  - github.com
+  - githubusercontent.com
+  - gitlab.com
+  - stackoverflow.com
+  - pypi.org
+  - npmjs.com
+
+software-updates:
+  - windowsupdate.com
+  - update.microsoft.com
+  - delivery.mp.microsoft.com
+  - swcdn.apple.com
+
+gambling:
+  - bet365.com
+  - pokerstars.com
+  - draftkings.com
+  - 1xbet.com
+
+# Test pages run by security vendors for checking filters. They are
+# harmless, but a real SWG classifies them as malicious, so they are useful
+# for demonstrating a block.
+security-test:
+  - testsafebrowsing.appspot.com
+  - wicar.org
+  - eicar.org
